@@ -226,7 +226,7 @@ func copyFile(src, dst string, perm os.FileMode, modTime time.Time, bar *progres
 	}()
 
 	// Create a buffer for copying
-	buf := make([]byte, 32*1024) // 32KB buffer
+	buf := make([]byte, 1024*1024) // 1MB buffer
 
 	// Use io.CopyBuffer with progress tracking
 	_, err = io.CopyBuffer(destFile, io.TeeReader(sourceFile, &progressWriter{bar: bar, mu: barMu}), buf)
@@ -234,11 +234,11 @@ func copyFile(src, dst string, perm os.FileMode, modTime time.Time, bar *progres
 		return fmt.Errorf("could not copy data from %s to %s: %w", src, dst, err)
 	}
 
-	// Sync file contents to disk
-	if err := destFile.Sync(); err != nil {
-		// Log warning, but don't necessarily fail the whole operation
-		fmt.Fprintf(os.Stderr, "\nWarning: Failed to sync file %s: %v\n", dst, err)
-	}
+	// Sync file contents to disk (this is safer by SUPER slow)
+	// if err := destFile.Sync(); err != nil {
+	// 	// Log warning, but don't necessarily fail the whole operation
+	// 	fmt.Fprintf(os.Stderr, "\nWarning: Failed to sync file %s: %v\n", dst, err)
+	// }
 
 	// Set modification time
 	if err := os.Chtimes(dst, modTime, modTime); err != nil {
