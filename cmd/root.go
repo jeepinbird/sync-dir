@@ -1,77 +1,109 @@
-/*
-Copyright © 2025 NAME HERE <EMAIL ADDRESS>
-
-*/
+// cmd/root.go
 package cmd
 
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
+	"github.com/jeepinbird/sync-dir/pkg/syncer" // Import the syncer package
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 )
 
-var cfgFile string
+var (
+	// Flags
+	excludePatterns []string // Stores values from --exclude flags
+	dryRun          bool     // Flag for dry run
 
-// rootCmd represents the base command when called without any subcommands
-var rootCmd = &cobra.Command{
-	Use:   "sync-dir",
-	Short: "A brief description of your application",
-	Long: `A longer description that spans multiple lines and likely contains
-examples and usage of using your application. For example:
+	// rootCmd represents the base command when called without any subcommands
+	rootCmd = &cobra.Command{
+		Use:   "sync-dir <source> <target>",
+		Short: "Synchronizes a source directory to a target directory.",
+		Long: `Synchronizes files and directories from a source path to a target path.
 
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
-	// Uncomment the following line if your bare application
-	// has an action associated with it:
-	// Run: func(cmd *cobra.Command, args []string) { },
-}
+The source is treated as the source of truth.
+- Files/directories in the target that do not exist in the source will be deleted.
+- Files that differ based on modification time and size will be updated from the source.
+- A checksum is automatically used to verify differences when modification times or sizes alone are inconclusive (e.g., same size but different time).
+- Exclusions can be specified via --exclude flags or a .sync-ignore file in the source directory.`,
+		Args: cobra.ExactArgs(2), // Requires exactly two arguments: source and target
+		RunE: func(cmd *cobra.Command, args []string) error {
+			sourcePath, err := filepath.Abs(args[0])
+			if err != nil {
+				return fmt.Errorf("invalid source path '%s': %w", args[0], err)
+			}
+			targetPath, err := filepath.Abs(args[1])
+			if err != nil {
+				return fmt.Errorf("invalid target path '%s': %w", args[1], err)
+			}
+
+			// Basic validation: source must exist and be a directory
+			sourceInfo, err := os.Stat(sourcePath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return fmt.Errorf("source path '%s' does not exist", sourcePath)
+				}
+				return fmt.Errorf("could not stat source path '%s': %w", sourcePath, err)
+			}
+			if !sourceInfo.IsDir() {
+				return fmt.Errorf("source path '%s' is not a directory", sourcePath)
+			}
+
+			// Target validation: if it exists, must be a directory
+			targetInfo, err := os.Stat(targetPath)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					return fmt.Errorf("could not stat target path '%s': %w", targetPath, err)
+				}
+				// Target doesn't exist, which is fine, it will be created
+			} else if !targetInfo.IsDir() {
+				return fmt.Errorf("target path '%s' exists but is not a directory", targetPath)
+			}
+
+			// Prevent syncing a directory to itself or a subdirectory of itself
+			if sourcePath == targetPath {
+				return fmt.Errorf("source and target paths cannot be the same")
+			}
+			rel, err := filepath.Rel(sourcePath, targetPath)
+			if err == nil && !filepath.IsAbs(rel) && len(rel) > 0 && rel[0] != '.' {
+				return fmt.Errorf("target path '%s' cannot be inside the source path '%s'", targetPath, sourcePath)
+			}
+
+			fmt.Printf("Source: %s\n", sourcePath)
+			fmt.Printf("Target: %s\n", targetPath)
+			if len(excludePatterns) > 0 {
+				fmt.Println("CLI Exclusions:", excludePatterns)
+			}
+			if dryRun {
+				fmt.Println("--- DRY RUN MODE ---")
+			}
+
+			// Create Syncer instance
+			sync := syncer.NewSyncer(sourcePath, targetPath, excludePatterns, dryRun)
+
+			// Run the synchronization process
+			err = sync.Run()
+			if err != nil {
+				return fmt.Errorf("sync failed: %w", err) // Wrap error for context
+			}
+
+			fmt.Println("\nSync completed successfully.")
+			if dryRun {
+				fmt.Println("(Dry run - no changes were actually made)")
+			}
+			return nil // Return nil for successful execution
+		},
+	}
+)
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
-func Execute() {
-	err := rootCmd.Execute()
-	if err != nil {
-		os.Exit(1)
-	}
+func Execute() error {
+	return rootCmd.Execute()
 }
 
 func init() {
-	cobra.OnInitialize(initConfig)
-
-	// Here you will define your flags and configuration settings.
-	// Cobra supports persistent flags, which, if defined here,
-	// will be global for your application.
-
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.sync-dir.yaml)")
-
-	// Cobra also supports local flags, which will only run
-	// when this action is called directly.
-	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
-}
-
-// initConfig reads in config file and ENV variables if set.
-func initConfig() {
-	if cfgFile != "" {
-		// Use config file from the flag.
-		viper.SetConfigFile(cfgFile)
-	} else {
-		// Find home directory.
-		home, err := os.UserHomeDir()
-		cobra.CheckErr(err)
-
-		// Search config in home directory with name ".sync-dir" (without extension).
-		viper.AddConfigPath(home)
-		viper.SetConfigType("yaml")
-		viper.SetConfigName(".sync-dir")
-	}
-
-	viper.AutomaticEnv() // read in environment variables that match
-
-	// If a config file is found, read it in.
-	if err := viper.ReadInConfig(); err == nil {
-		fmt.Fprintln(os.Stderr, "Using config file:", viper.ConfigFileUsed())
-	}
+	// Define flags
+	rootCmd.Flags().StringSliceVarP(&excludePatterns, "exclude", "e", []string{}, "Patterns to exclude (can be specified multiple times)")
+	rootCmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be done without actually performing any actions")
 }
