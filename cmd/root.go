@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -14,6 +15,7 @@ var (
 	// Flags
 	excludePatterns []string // Stores values from --exclude flags
 	dryRun          bool     // Flag for dry run
+	verbosity       string   // Verbosity level
 
 	// rootCmd represents the base command when called without any subcommands
 	rootCmd = &cobra.Command{
@@ -28,6 +30,23 @@ The source is treated as the source of truth.
 - Exclusions can be specified via --exclude flags or a .sync-ignore file in the source directory.`,
 		Args: cobra.ExactArgs(2), // Requires exactly two arguments: source and target
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Set up logging based on verbosity flag
+			var logLevel slog.Leveler
+			switch verbosity {
+			case "debug":
+				logLevel = slog.LevelDebug
+			case "info":
+				logLevel = slog.LevelInfo
+			case "warn":
+				logLevel = slog.LevelWarn
+			case "error":
+				logLevel = slog.LevelError
+			default:
+				logLevel = slog.LevelInfo
+			}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+			slog.SetDefault(logger)
+
 			sourcePath, err := filepath.Abs(args[0])
 			if err != nil {
 				return fmt.Errorf("invalid source path '%s': %w", args[0], err)
@@ -69,17 +88,18 @@ The source is treated as the source of truth.
 				return fmt.Errorf("target path '%s' cannot be inside the source path '%s'", targetPath, sourcePath)
 			}
 
-			fmt.Printf("Source: %s\n", sourcePath)
-			fmt.Printf("Target: %s\n", targetPath)
+			logger.Info(fmt.Sprintf("Source: %s", sourcePath))
+			logger.Info(fmt.Sprintf("Target: %s", targetPath))
 			if len(excludePatterns) > 0 {
-				fmt.Println("CLI Exclusions:", excludePatterns)
+				logger.Info(fmt.Sprintf("CLI Exclusions: %v", excludePatterns))
 			}
 			if dryRun {
-				fmt.Println("--- DRY RUN MODE ---")
+				logger.Info("--- DRY RUN MODE ---")
 			}
 
 			// Create Syncer instance
 			sync := syncer.NewSyncer(sourcePath, targetPath, excludePatterns, dryRun)
+			sync.SetLogLevel(logLevel)
 
 			// Run the synchronization process
 			err = sync.Run()
@@ -87,9 +107,9 @@ The source is treated as the source of truth.
 				return fmt.Errorf("sync failed: %w", err) // Wrap error for context
 			}
 
-			fmt.Println("\nSync completed successfully.")
+			logger.Info("\nSync completed successfully.")
 			if dryRun {
-				fmt.Println("(Dry run - no changes were actually made)")
+				logger.Info("(Dry run - no changes were actually made)")
 			}
 			return nil // Return nil for successful execution
 		},
@@ -106,4 +126,5 @@ func init() {
 	// Define flags
 	rootCmd.Flags().StringSliceVarP(&excludePatterns, "exclude", "e", []string{}, "Patterns to exclude (can be specified multiple times)")
 	rootCmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be done without actually performing any actions")
+	rootCmd.Flags().StringVarP(&verbosity, "verbosity", "v", "info", "Log verbosity level (debug, info, warn, error)")
 }

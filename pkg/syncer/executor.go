@@ -5,28 +5,31 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/schollz/progressbar/v3"
+	"github.com/jeepinbird/sync-dir/pkg/progress"
 )
 
 const maxConcurrentOps = 10 // Max number of parallel file operations
 
 // executePlan performs the actions defined in the SyncPlan.
 func executePlan(plan *SyncPlan, sourceRoot, targetRoot string, dryRun bool) error {
+	logger := slog.Default()
+
 	if len(plan.Actions) == 0 {
-		fmt.Println("No actions needed. Source and target are already in sync.")
+		logger.Info("No actions needed. Source and target are already in sync.")
 		return nil
 	}
 
 	// --- Display Plan and Ask for Confirmation ---
-	fmt.Println("\n--- Sync Plan ---")
-	fmt.Printf("Adds: %d, Updates: %d, Deletes: %d\n", plan.Adds, plan.Updates, plan.Deletes)
-	fmt.Println("-----------------")
+	logger.Info("\n--- Sync Plan ---")
+	logger.Info(fmt.Sprintf("Adds: %d, Updates: %d, Deletes: %d", plan.Adds, plan.Updates, plan.Deletes))
+	logger.Info("-----------------")
 
 	// Show sample actions (up to 20)
 	limit := 20
@@ -34,7 +37,7 @@ func executePlan(plan *SyncPlan, sourceRoot, targetRoot string, dryRun bool) err
 		limit = len(plan.Actions)
 	}
 	if limit > 0 {
-		fmt.Println("Sample actions:")
+		logger.Info("Sample actions:")
 		for i := 0; i < limit; i++ {
 			action := plan.Actions[i]
 			actionType := ""
@@ -46,16 +49,16 @@ func executePlan(plan *SyncPlan, sourceRoot, targetRoot string, dryRun bool) err
 			case Delete:
 				actionType = "[DELETE]"
 			}
-			fmt.Printf("  %s %s\n", actionType, action.RelPath)
+			logger.Info(fmt.Sprintf("  %s %s", actionType, action.RelPath))
 		}
 		if len(plan.Actions) > limit {
-			fmt.Printf("  ... and %d more actions\n", len(plan.Actions)-limit)
+			logger.Info(fmt.Sprintf("  ... and %d more actions", len(plan.Actions)-limit))
 		}
-		fmt.Println("-----------------")
+		logger.Info("-----------------")
 	}
 
 	if dryRun {
-		fmt.Println("Dry run: No changes will be made.")
+		logger.Info("Dry run: No changes will be made.")
 		return nil // Stop here for dry run
 	}
 
@@ -69,11 +72,11 @@ func executePlan(plan *SyncPlan, sourceRoot, targetRoot string, dryRun bool) err
 	response = strings.TrimSpace(strings.ToLower(response))
 
 	if response != "" && response != "y" && response != "yes" {
-		fmt.Println("Synchronization aborted by user.")
+		logger.Info("Synchronization aborted by user.")
 		return nil // User cancelled
 	}
 
-	fmt.Println("Starting synchronization...")
+	logger.Info("Starting synchronization...")
 
 	// --- Execute Actions Concurrently ---
 	var wg sync.WaitGroup
@@ -88,21 +91,33 @@ func executePlan(plan *SyncPlan, sourceRoot, targetRoot string, dryRun bool) err
 		}
 	}
 
-	bar := progressbar.NewOptions64(totalSize,
-		progressbar.OptionSetDescription("Syncing files..."),
-		progressbar.OptionSetWriter(os.Stderr),
-		progressbar.OptionSetWidth(15),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionClearOnFinish(),
-		progressbar.OptionThrottle(100*time.Millisecond), // Refresh rate
+	// Create our enhanced progress bar
+	bar := progress.New(
+		totalSize,
+		"Syncing files",
+		progress.Sync,
+		&progress.Options{
+			ShowBytes:       true,
+			Detailed:        true,
+			RateInterval:    250 * time.Millisecond,
+			RateWindowSize:  10,
+			RefreshInterval: 100 * time.Millisecond,
+			Output:          os.Stderr,
+		},
 	)
+	bar.Start()
+
+	// Make sure to finish the progress bar when done
 	defer func() {
-		if err := bar.Clear(); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to clear progress bar: %v\n", err)
+		if err := bar.Finish(); err != nil {
+			logger.Error(fmt.Sprintf("Failed to finish progress bar: %v", err))
 		}
 	}()
 
-	var copyMu sync.Mutex // Mutex for progress bar updates during copy
+	// Create a channel to signal when files are ready for progress updates
+	// This helps prevent the "hanging" issue you described
+	readyChan := make(chan struct{}, 1)
+	readyChan <- struct{}{} // Signal that we're ready to start
 
 	for _, action := range plan.Actions {
 		wg.Add(1)
@@ -114,6 +129,9 @@ func executePlan(plan *SyncPlan, sourceRoot, targetRoot string, dryRun bool) err
 
 			var execErr error
 			targetPath := filepath.Join(targetRoot, act.RelPath)
+
+			// Update progress display with current file
+			bar.SetCurrentFile(act.RelPath)
 
 			switch act.Type {
 			case Add:
@@ -133,7 +151,7 @@ func executePlan(plan *SyncPlan, sourceRoot, targetRoot string, dryRun bool) err
 					}
 				} else {
 					// Add file (copy from source)
-					execErr = copyFile(act.SourceInfo.AbsPath, targetPath, act.SourceInfo.Mode.Perm(), act.SourceInfo.ModTime, bar, &copyMu)
+					execErr = copyFile(act.SourceInfo.AbsPath, targetPath, act.SourceInfo.Mode.Perm(), act.SourceInfo.ModTime, bar)
 					if execErr != nil {
 						execErr = fmt.Errorf("failed to copy file for add %s: %w", act.RelPath, execErr)
 					}
@@ -145,9 +163,9 @@ func executePlan(plan *SyncPlan, sourceRoot, targetRoot string, dryRun bool) err
 				if act.SourceInfo.IsDir {
 					// This case should ideally be handled by delete+add if type changes
 					// If types match (both dirs), no action needed here.
-					fmt.Fprintf(os.Stderr, "\nWarning: Unexpected 'Update' action for directory: %s\n", act.RelPath)
+					logger.Warn(fmt.Sprintf("Unexpected 'Update' action for directory: %s", act.RelPath))
 				} else {
-					execErr = copyFile(act.SourceInfo.AbsPath, targetPath, act.SourceInfo.Mode.Perm(), act.SourceInfo.ModTime, bar, &copyMu)
+					execErr = copyFile(act.SourceInfo.AbsPath, targetPath, act.SourceInfo.Mode.Perm(), act.SourceInfo.ModTime, bar)
 					if execErr != nil {
 						execErr = fmt.Errorf("failed to copy file for update %s: %w", act.RelPath, execErr)
 					}
@@ -173,8 +191,7 @@ func executePlan(plan *SyncPlan, sourceRoot, targetRoot string, dryRun bool) err
 					execErr = fmt.Errorf("failed to stat item for deletion %s: %w", act.RelPath, statErr)
 				}
 				// If os.IsNotExist(statErr), item is already gone, no error.
-
-			} // end switch
+			}
 
 			if execErr != nil {
 				errChan <- execErr // Send error to the channel
@@ -198,19 +215,24 @@ func executePlan(plan *SyncPlan, sourceRoot, targetRoot string, dryRun bool) err
 		return fmt.Errorf("synchronization finished with %d error(s):\n- %s", len(errors), strings.Join(errors, "\n- "))
 	}
 
-	fmt.Println("\nSynchronization finished successfully.")
+	logger.Info("Synchronization finished successfully.")
 	return nil
 }
 
 // copyFile copies a file from src to dst, sets permissions and mod time, and updates progress bar.
-func copyFile(src, dst string, perm os.FileMode, modTime time.Time, bar *progressbar.ProgressBar, barMu *sync.Mutex) error {
+func copyFile(src, dst string, perm os.FileMode, modTime time.Time, bar *progress.Progress) error {
+	logger := slog.Default()
+
+	// Update progress with current file
+	bar.SetCurrentFile(filepath.Base(src))
+
 	sourceFile, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("could not open source %s: %w", src, err)
 	}
 	defer func() {
 		if err := sourceFile.Close(); err != nil {
-			fmt.Printf("Error closing %s: %v\n", src, err)
+			logger.Warn("Error closing %s: %v", src, err)
 		}
 	}()
 
@@ -221,50 +243,27 @@ func copyFile(src, dst string, perm os.FileMode, modTime time.Time, bar *progres
 	}
 	defer func() {
 		if err := destFile.Close(); err != nil {
-			fmt.Printf("Error closing %s: %v\n", dst, err)
+			logger.Warn("Error closing %s: %v", dst, err)
 		}
 	}()
 
 	// Create a buffer for copying
 	buf := make([]byte, 1024*1024) // 1MB buffer
 
-	// Use io.CopyBuffer with progress tracking
-	_, err = io.CopyBuffer(destFile, io.TeeReader(sourceFile, &progressWriter{bar: bar, mu: barMu}), buf)
+	// Wrap the reader with our progress reader
+	progressReader := progress.NewReader(sourceFile, bar)
+
+	// Use io.CopyBuffer for efficient copying
+	_, err = io.CopyBuffer(destFile, progressReader, buf)
 	if err != nil {
 		return fmt.Errorf("could not copy data from %s to %s: %w", src, dst, err)
 	}
 
-	// Sync file contents to disk (this is safer by SUPER slow)
-	// if err := destFile.Sync(); err != nil {
-	// 	// Log warning, but don't necessarily fail the whole operation
-	// 	fmt.Fprintf(os.Stderr, "\nWarning: Failed to sync file %s: %v\n", dst, err)
-	// }
-
 	// Set modification time
 	if err := os.Chtimes(dst, modTime, modTime); err != nil {
 		// Log warning, as setting time might fail on some systems/filesystems
-		fmt.Fprintf(os.Stderr, "\nWarning: Failed to set modification time for %s: %v\n", dst, err)
+		logger.Warn("Failed to set modification time for %s: %v", dst, err)
 	}
-
-	// Note: Setting exact permissions after creation might be needed on some OS
-	// if os.Chmod(dst, perm) != nil { ... }
 
 	return nil
-}
-
-// progressWriter is a helper to update the progress bar during io.Copy
-type progressWriter struct {
-	bar *progressbar.ProgressBar
-	mu  *sync.Mutex // Mutex to protect concurrent bar updates
-}
-
-func (pw *progressWriter) Write(p []byte) (int, error) {
-	n := len(p)
-	pw.mu.Lock()
-	err := pw.bar.Add(n)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "\nexecutor: Error updating progress bar: %v\n", err)
-	}
-	pw.mu.Unlock()
-	return n, nil
 }

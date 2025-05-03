@@ -3,6 +3,8 @@ package syncer
 
 import (
 	"fmt"
+	"log/slog"
+	"os"
 	"sync"
 
 	"github.com/jeepinbird/sync-dir/pkg/fileinfo"
@@ -15,6 +17,7 @@ type Syncer struct {
 	TargetRoot    string
 	CliExcludes   []string
 	DryRun        bool
+	LogLevel      slog.Leveler
 	ignoreMatcher *ignore.Matcher
 	sourceFiles   map[string]*fileinfo.FileInfo
 	targetFiles   map[string]*fileinfo.FileInfo
@@ -28,12 +31,26 @@ func NewSyncer(sourceRoot, targetRoot string, cliExcludes []string, dryRun bool)
 		TargetRoot:  targetRoot,
 		CliExcludes: cliExcludes,
 		DryRun:      dryRun,
+		LogLevel:    slog.LevelInfo,
 	}
+}
+
+// SetLogLevel configures the verbosity of logging
+func (s *Syncer) SetLogLevel(level slog.Leveler) {
+	s.LogLevel = level
+	// Create a new logger with the desired log level
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	slog.SetDefault(logger)
 }
 
 // Run executes the entire synchronization process: load ignores, scan, plan, execute.
 func (s *Syncer) Run() error {
 	var err error
+
+	// Initialize the checksum workers
+	startChecksumWorkers()
+	// Ensure they're stopped when we're done
+	defer stopChecksumWorkers()
 
 	// 1. Load Ignore Rules
 	s.ignoreMatcher, err = ignore.NewMatcher(s.SourceRoot, s.CliExcludes)
@@ -67,7 +84,7 @@ func (s *Syncer) Run() error {
 	if targetErr != nil {
 		// Target scan errors are often less critical (e.g., target doesn't exist yet)
 		// But we should still report them. If targetFiles is nil, planning will handle it.
-		fmt.Printf("Note: Error scanning target directory: %v\n", targetErr)
+		slog.Warn("Error scanning target directory", "targetErr", targetErr)
 		// Ensure targetFiles is initialized even if scan failed partially or fully
 		if s.targetFiles == nil {
 			s.targetFiles = make(map[string]*fileinfo.FileInfo)
